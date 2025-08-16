@@ -33,6 +33,7 @@ INDEX_HTML = """
 RESULT_HTML = """
 <!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Flash-cut Result</title><link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css\"><style>.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.box{border:1px solid #ddd;border-radius:12px;padding:1rem;background:#fff}img.wave{max-width:100%;border-radius:12px;border:1px solid #ddd;background:#fff;max-height:320px;object-fit:cover}</style></head><body><main class=\"container\"><h2>Flash-cut Result</h2><p class=\"mono\">Job: {{ job_id }}</p><div class=\"grid\"><section class=\"box\"><h4>Summary</h4><ul><li>Onsets: <strong>{{ num_onsets }}</strong></li><li>Segments: <strong>{{ num_segments }}</strong></li><li>Flash cuts: <strong>{{ num_flash }}</strong> ({{ flash_start }}–{{ flash_end }} s)</li><li>FPS: {{ fps }}, Threshold: {{ threshold }}, Max gap: {{ max_gap }}</li></ul><div><a href=\"{{ url_for('download', job_id=job_id, filename='cuts.json') }}\">Download cuts.json</a> • <a href=\"{{ url_for('download', job_id=job_id, filename='cuts.csv') }}\">Download cuts.csv</a> • <a href=\"{{ url_for('download', job_id=job_id, filename='waveform.png') }}\">Download waveform.png</a>{% if rendered %} • <a href=\"{{ url_for('download', job_id=job_id, filename=output_name) }}\">Download {{ output_name }}</a>{% endif %}</div></section><section class=\"box\"><h4>Waveform</h4><img class=\"wave\" src=\"{{ url_for('download', job_id=job_id, filename='waveform.png') }}\" alt=\"waveform\"></section></div><details><summary>Segments (first 100)</summary><pre class=\"mono\" style=\"white-space:pre-wrap\">{{ segments_preview }}</pre></details><p><a href=\"{{ url_for('index') }}\">← New analysis</a></p></main></body></html>
 """
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB cap
 
 # ---------------- helpers ----------------
 
@@ -415,3 +416,4 @@ if __name__ == "__main__":
     from werkzeug.serving import run_simple
     print("Starting Flask development server... open http://127.0.0.1:5000")
     run_simple("127.0.0.1", 5000, app, use_reloader=False, use_debugger=True)
+
