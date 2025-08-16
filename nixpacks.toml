@@ -1,0 +1,9 @@
+# Railway Nixpacks configuration
+# Ensures Python version and FFmpeg availability for rendering
+
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11.9"
+
+[phases.setup]
+# Install system packages
+nixPkgs = ["ffmpeg"]
