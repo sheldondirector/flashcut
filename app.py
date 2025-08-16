@@ -407,13 +407,16 @@ def plot_waveform(png_path: Path, y: np.ndarray, sr: int, flash_times: List[floa
     plt.tight_layout()
     plt.savefig(png_path, dpi=150)
     plt.close()
+# --- keep everything above as-is ---
 
-@app.route("/ui")
-def ui():
-    return redirect(url_for("index"))
+@app.route("/health")
+def health():
+    return {"ok": True}
 
 if __name__ == "__main__":
-    from werkzeug.serving import run_simple
-    print("Starting Flask development server... open http://127.0.0.1:5000")
-    run_simple("127.0.0.1", 5000, app, use_reloader=False, use_debugger=True)
+    import os
+    import matplotlib
+    matplotlib.use("Agg")  # headless on Railway
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
 
