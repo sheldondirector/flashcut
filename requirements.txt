@@ -1,6 +1,9 @@
-flask
-gunicorn
-numpy
-librosa
-soundfile
-matplotlib
+flask==3.0.3
+gunicorn==22.0.0
+# Pinned for binary wheels compatibility on Railway (manylinux + py311)
+numpy<2.0
+scipy==1.11.4
+librosa==0.10.2.post1
+soundfile==0.12.1
+matplotlib==3.8.4
+setuptools>=68
