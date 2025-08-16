@@ -282,7 +282,11 @@ def analyze():
     audio_path = job_dir / audio_file.filename
     audio_file.save(str(audio_path))
 
-    events, duration, sr, y = detect_beats(str(audio_path), threshold=threshold)
+    try:
+        events, duration, sr, y = detect_beats(str(audio_path), threshold=threshold)
+    except Exception as e:
+        flash("Failed to read audio. If you uploaded MP3, enable FFmpeg on Railway or upload a WAV/FLAC/OGG file.\n" + str(e))
+        return redirect(url_for("index"))
     starts, ends = compute_intervals(events, duration, fps, max_gap)
 
     flash_times = detect_flash_window(y, sr, (flash_start, flash_end), flash_gap, fps, threshold) if flash_end > flash_start else []
