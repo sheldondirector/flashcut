@@ -1,1 +1,1 @@
-web: bash -lc 'gunicorn app:app -w 1 -k gthread --threads=4 --timeout=600 --graceful-timeout=600 --keep-alive=75 -b 0.0.0.0:$PORT'
+web: gunicorn app:app -w 1 -k gthread --threads=4 --timeout=600 --graceful-timeout=600 --keep-alive=75 -b 0.0.0.0:$PORT
