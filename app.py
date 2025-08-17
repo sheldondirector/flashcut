@@ -6,7 +6,7 @@ from flask import Flask, request, redirect, url_for, render_template_string, sen
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime
-import subprocess, shutil, json, os, sys, platform, textwrap
+import subprocess, shutil, json, os, sys, platform, textwrap, re, time
 
 # ---------------- numeric / plotting ----------------
 import numpy as np
@@ -48,6 +48,13 @@ except Exception as e:
 
 FRAME_HOP = 512
 
+# Mobile optimization settings
+MOBILE_MAX_DURATION = 60.0  # Max 60 seconds for mobile
+MOBILE_SAMPLE_RATE = 22050  # Reduced sample rate for mobile
+MOBILE_FRAME_HOP = 1024     # Larger hop for mobile (faster processing)
+MOBILE_PLOT_DPI = 100       # Lower DPI for mobile plots
+DESKTOP_PLOT_DPI = 150      # Higher DPI for desktop
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret")
 BASE_DIR = Path(__file__).parent.resolve()
@@ -55,6 +62,59 @@ JOBS_DIR = BASE_DIR / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
 # ---------------- diagnostics helpers ----------------
+
+def is_mobile_device() -> bool:
+    """Detect if the request comes from a mobile device"""
+    user_agent = request.headers.get('User-Agent', '').lower()
+    mobile_patterns = [
+        r'mobile', r'android', r'iphone', r'ipad', r'ipod', 
+        r'blackberry', r'nokia', r'opera mini', r'palm', 
+        r'windows phone', r'kindle', r'silk', r'fennec'
+    ]
+    return any(re.search(pattern, user_agent) for pattern in mobile_patterns)
+
+def get_processing_config() -> dict:
+    """Get processing configuration based on device type"""
+    if is_mobile_device():
+        return {
+            'max_duration': MOBILE_MAX_DURATION,
+            'sample_rate': MOBILE_SAMPLE_RATE,
+            'hop_length': MOBILE_FRAME_HOP,
+            'plot_dpi': MOBILE_PLOT_DPI,
+            'device_type': 'mobile'
+        }
+    else:
+        return {
+            'max_duration': float('inf'),
+            'sample_rate': None,  # Let librosa choose
+            'hop_length': FRAME_HOP,
+            'plot_dpi': DESKTOP_PLOT_DPI,
+            'device_type': 'desktop'
+        }
+
+def log_performance(operation: str, duration: float, device_type: str = None):
+    """Log performance metrics for debugging mobile issues"""
+    if device_type is None:
+        device_type = 'mobile' if is_mobile_device() else 'desktop'
+    
+    log_entry = {
+        'timestamp': datetime.now().isoformat(),
+        'operation': operation,
+        'duration_seconds': round(duration, 3),
+        'device_type': device_type,
+        'user_agent': request.headers.get('User-Agent', 'unknown')[:200]
+    }
+    
+    # Log to a simple text file for Railway deployment
+    log_dir = BASE_DIR / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "performance.log"
+    
+    try:
+        with open(log_file, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+    except Exception:
+        pass  # Don't fail if logging fails
 
 def _ffmpeg_bin() -> str:
     return os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "ffmpeg"
@@ -109,9 +169,23 @@ def get_diag() -> dict:
     except Exception:
         np_show_config = ""
 
+    # Mobile-specific diagnostics
+    mobile_detected = is_mobile_device()
+    config = get_processing_config()
+    user_agent = request.headers.get('User-Agent', 'unknown')
+
     diag = {
         "python": sys.version.split()[0],
         "platform": f"{platform.system()} {platform.release()}",
+        "mobile": {
+            "is_mobile": mobile_detected,
+            "device_type": config['device_type'],
+            "user_agent": user_agent[:200],
+            "max_duration": config['max_duration'],
+            "sample_rate": config['sample_rate'],
+            "hop_length": config['hop_length'],
+            "plot_dpi": config['plot_dpi'],
+        },
         "env": {
             "PYTHON_VERSION": os.environ.get("PYTHON_VERSION"),
             "NIXPACKS_PKGS": os.environ.get("NIXPACKS_PKGS"),
@@ -144,7 +218,10 @@ def get_diag() -> dict:
             "On Railway, set env var NIXPACKS_PKGS='ffmpeg libsndfile' so MP3/M4A/WAV decode works.",
             "Pin wheels in requirements.txt (numpy==1.26.4, librosa==0.10.2.post1, soundfile==0.12.1, audioread==3.0.1, matplotlib==3.8.4).",
             "Gunicorn: --timeout 600 --threads 4 for long analyses.",
-        ],
+        ] + ([
+            f"Mobile device detected: Audio limited to {config['max_duration']}s, using optimized settings for better performance.",
+            "For longer files or full features, consider using a desktop browser.",
+        ] if mobile_detected else []),
     }
     return diag
 
@@ -156,11 +233,22 @@ def render_diag_html(diag: dict) -> str:
     bins = diag.get("bins", {})
     ab = diag.get("audio_backends", {})
     env = diag.get("env", {})
+    mobile = diag.get("mobile", {})
     imports = diag.get("import_errors") or {}
 
     rows = []
     rows.append(f"<tr><td>Python</td><td>{diag.get('python')}</td></tr>")
     rows.append(f"<tr><td>Platform</td><td>{diag.get('platform')}</td></tr>")
+    
+    # Mobile-specific diagnostics
+    device_color = "#16a34a" if mobile.get('device_type') == 'desktop' else "#f59e0b"
+    rows.append(f"<tr><td>Device Type</td><td><span style=\"color:{device_color};font-weight:600;\">{mobile.get('device_type', 'unknown').upper()}</span></td></tr>")
+    if mobile.get('is_mobile'):
+        rows.append(f"<tr><td>Max Duration</td><td>{mobile.get('max_duration')}s</td></tr>")
+        rows.append(f"<tr><td>Sample Rate</td><td>{mobile.get('sample_rate')}Hz</td></tr>")
+        rows.append(f"<tr><td>Hop Length</td><td>{mobile.get('hop_length')}</td></tr>")
+        rows.append(f"<tr><td>Plot DPI</td><td>{mobile.get('plot_dpi')}</td></tr>")
+    
     rows.append(f"<tr><td>numpy</td><td>{v.get('numpy')}</td></tr>")
     rows.append(f"<tr><td>librosa</td><td>{v.get('librosa')}</td></tr>")
     rows.append(f"<tr><td>soundfile</td><td>{v.get('soundfile')}</td></tr>")
@@ -212,14 +300,31 @@ body{padding-block:1rem}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .wave{max-width:100%;border-radius:12px;border:1px solid #ddd;background:#fff}
 .box{border:1px solid #ddd;border-radius:12px;padding:1rem;background:#fff}
-</style></head><body><main class="container">
+.mobile-warning{background:#fef3c7;border:1px solid #f59e0b;padding:1rem;border-radius:8px;margin:1rem 0}
+.loading{display:none;text-align:center;padding:2rem}
+.spinner{border:4px solid #f3f3f3;border-top:4px solid #3498db;border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite;margin:0 auto 1rem}
+@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+</style>
+<script>
+function showLoading() {
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('form').style.display = 'none';
+}
+</script>
+</head><body><main class="container">
 <h2>Flash-cut Builder</h2>
 <p class="mono"><a href="{{ url_for('diag_page') }}">Open full diagnostics → /diag</a></p>
 {% with messages = get_flashed_messages() %}{% if messages %}<article>{% for m in messages %}<p>{{m}}</p>{% endfor %}</article>{% endif %}{% endwith %}
 
 {{ diag_html|safe }}
 
-<form action="{{ url_for('analyze') }}" method="post" enctype="multipart/form-data">
+<div id="loading" class="loading">
+  <div class="spinner"></div>
+  <p>Processing audio file... This may take a moment on mobile devices.</p>
+  <p><small>Mobile devices use optimized settings for better performance.</small></p>
+</div>
+
+<form id="form" action="{{ url_for('analyze') }}" method="post" enctype="multipart/form-data" onsubmit="showLoading()">
   <fieldset><legend>Audio</legend>
     <input type="file" name="audio" accept=".mp3,.m4a,.wav,.aac,.ogg,.flac,audio/mpeg,audio/mp4,audio/x-m4a,audio/wav,audio/*" required>
   </fieldset>
@@ -314,6 +419,8 @@ def confidence_from_envelope(times, env, sr, hop):
 def detect_onsets_flux(y: np.ndarray, sr: int, hop: int = FRAME_HOP, threshold: float = 0.30) -> List[dict]:
     if librosa is None:
         return []
+    
+    start_time = time.time()
     _, y_perc = librosa.effects.hpss(y)
     env = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=hop, aggregate=np.median)
     onset_times = librosa.onset.onset_detect(
@@ -322,21 +429,44 @@ def detect_onsets_flux(y: np.ndarray, sr: int, hop: int = FRAME_HOP, threshold: 
     )
     conf = confidence_from_envelope(onset_times, env, sr, hop)
     keep = [i for i, c in enumerate(conf) if c >= threshold]
+    
+    # Log performance
+    duration = time.time() - start_time
+    log_performance("onset_detection", duration)
+    
     return [{"time": float(onset_times[i]), "confidence": float(conf[i])} for i in keep]
 
 def detect_beats(audio_path: str, threshold: float):
     if librosa is None:
         raise RuntimeError("librosa not available on server — see Diagnostics below.")
+    
+    start_time = time.time()
+    config = get_processing_config()
+    
     # Let librosa choose best backend (soundfile -> libsndfile, fallback to audioread/ffmpeg)
     try:
-        y, sr = librosa.load(audio_path, sr=None, mono=True)
+        y, sr = librosa.load(audio_path, sr=config['sample_rate'], mono=True)
     except Exception as e:
         raise RuntimeError(
             "Audio decode failed. Ensure ffmpeg & libsndfile are installed on the server "
             "or upload WAV/FLAC/OGG. Original error: %s" % e
         )
+    
     duration = float(librosa.get_duration(y=y, sr=sr))
-    events = detect_onsets_flux(y, sr, hop=FRAME_HOP, threshold=threshold)
+    
+    # Check duration limits for mobile
+    if config['device_type'] == 'mobile' and duration > config['max_duration']:
+        raise RuntimeError(
+            f"Audio file too long for mobile device ({duration:.1f}s > {config['max_duration']:.1f}s). "
+            f"Please upload a shorter file or use a desktop browser for longer files."
+        )
+    
+    events = detect_onsets_flux(y, sr, hop=config['hop_length'], threshold=threshold)
+    
+    # Log total processing time
+    total_duration = time.time() - start_time
+    log_performance("audio_analysis_total", total_duration)
+    
     return events, duration, sr, y
 
 def compute_intervals(beats: List[dict], duration: float, fps: float, max_gap: float):
@@ -509,10 +639,23 @@ def diag_page():
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    start_time = time.time()
+    config = get_processing_config()
+    
     audio_file = request.files.get("audio")
     if not audio_file or audio_file.filename == "":
         flash("Please upload an audio file.")
         return redirect(url_for("index"))
+
+    # Check file size for mobile devices
+    if config['device_type'] == 'mobile':
+        # Get file size (approximation from content length)
+        file_size_mb = len(audio_file.read()) / (1024 * 1024)
+        audio_file.seek(0)  # Reset file pointer
+        
+        if file_size_mb > 10:  # 10MB limit for mobile
+            flash(f"File too large for mobile device ({file_size_mb:.1f}MB > 10MB). Please use a smaller file or desktop browser.")
+            return redirect(url_for("index"))
 
     fps = float(request.form.get("fps", 30))
     threshold = float(request.form.get("threshold", 0.30))
@@ -526,6 +669,11 @@ def analyze():
         clip_mode = "head"
     output_name = (request.form.get("output_name", "final_video.mp4") or "final_video.mp4").strip()
 
+    # Disable rendering for mobile to save resources
+    if config['device_type'] == 'mobile' and do_render:
+        flash("Video rendering disabled on mobile devices for better performance. Analysis only will be performed.")
+        do_render = False
+
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -536,12 +684,21 @@ def analyze():
     try:
         events, duration, sr, y = detect_beats(str(audio_path), threshold=threshold)
     except Exception as e:
-        flash("Failed to read audio. If you uploaded MP3, enable FFmpeg on Railway or upload a WAV/FLAC/OGG file.\n" + str(e))
+        error_msg = str(e)
+        if config['device_type'] == 'mobile':
+            error_msg += "\n\nMobile devices have limited processing capabilities. Try a shorter file or use a desktop browser for larger files."
+        flash(f"Failed to read audio. {error_msg}")
         return redirect(url_for("index"))
 
     starts, ends = compute_intervals(events, duration, fps, max_gap)
 
-    flash_times = detect_flash_window(y, sr, (flash_start, flash_end), flash_gap, fps, threshold) if flash_end > flash_start else []
+    try:
+        flash_times = detect_flash_window(y, sr, (flash_start, flash_end), flash_gap, fps, threshold) if flash_end > flash_start else []
+    except Exception as e:
+        flash_times = []
+        if config['device_type'] == 'mobile':
+            # Don't fail completely on mobile, just skip flash detection
+            flash("Flash detection skipped on mobile device to improve performance.")
 
     data = {
         "audio": audio_file.filename,
@@ -604,6 +761,10 @@ def analyze():
         preview_lines.append(f"{i+1:03d}: {s:.3f} – {e:.3f}")
     segments_preview = "\n".join(preview_lines)
 
+    # Log total processing time
+    total_time = time.time() - start_time
+    log_performance("total_analysis", total_time)
+
     diag = get_diag()
     return render_template_string(
         RESULT_HTML,
@@ -644,10 +805,25 @@ def inject_flash_splits(starts: List[float], ends: List[float], flash_times: Lis
 def plot_waveform(png_path: Path, y: np.ndarray, sr: int, flash_times: List[float], window: Tuple[float, float]):
     if plt is None or librosa is None:
         return
-    t = np.linspace(0, librosa.get_duration(y=y, sr=sr), num=len(y), endpoint=True)
-    plt.figure(figsize=(18, 4))
-    plt.fill_between(t, y, -y, color="#f0b429", alpha=0.25)
-    plt.plot(t, y, color="#f0b429", lw=0.7, alpha=0.8)
+    
+    start_time = time.time()
+    config = get_processing_config()
+    
+    # Optimize plot for mobile devices
+    if config['device_type'] == 'mobile':
+        figsize = (12, 3)  # Smaller figure for mobile
+        downsample = max(1, len(y) // 20000)  # Downsample for mobile
+    else:
+        figsize = (18, 4)
+        downsample = max(1, len(y) // 50000)  # Less aggressive downsampling for desktop
+    
+    # Downsample data for faster rendering
+    y_plot = y[::downsample]
+    t = np.linspace(0, librosa.get_duration(y=y, sr=sr), num=len(y_plot), endpoint=True)
+    
+    plt.figure(figsize=figsize)
+    plt.fill_between(t, y_plot, -y_plot, color="#f0b429", alpha=0.25)
+    plt.plot(t, y_plot, color="#f0b429", lw=0.7, alpha=0.8)
     lo, hi = min(window), max(window)
     plt.axvline(lo, color="red", ls="--", lw=2, dashes=(6, 6))
     plt.axvline(hi, color="red", ls="--", lw=2, dashes=(6, 6))
@@ -658,12 +834,59 @@ def plot_waveform(png_path: Path, y: np.ndarray, sr: int, flash_times: List[floa
     plt.ylabel("Amplitude")
     plt.grid(True, alpha=0.25, ls="--")
     plt.tight_layout()
-    plt.savefig(png_path, dpi=150)
+    plt.savefig(png_path, dpi=config['plot_dpi'])
     plt.close()
+    
+    # Log plot generation time
+    duration = time.time() - start_time
+    log_performance("plot_generation", duration)
 
 @app.route("/health")
 def health():
     return {"ok": True}
+
+@app.route("/logs")
+def view_logs():
+    """View performance logs for debugging mobile issues"""
+    log_file = BASE_DIR / "logs" / "performance.log"
+    if not log_file.exists():
+        return "<h1>No performance logs available</h1>"
+    
+    try:
+        with open(log_file, 'r') as f:
+            lines = f.readlines()[-50:]  # Last 50 entries
+        
+        logs = []
+        for line in lines:
+            try:
+                logs.append(json.loads(line.strip()))
+            except:
+                continue
+        
+        html = """
+        <!doctype html><html><head><title>Performance Logs</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+        <style>.mono{font-family:monospace}</style>
+        </head><body><main class="container">
+        <h2>Performance Logs (Last 50 entries)</h2>
+        <p><a href="/">← Back to main</a></p>
+        <table><thead><tr><th>Time</th><th>Operation</th><th>Duration (s)</th><th>Device</th><th>User Agent</th></tr></thead><tbody>
+        """
+        
+        for log in reversed(logs):
+            html += f"""<tr>
+                <td class="mono">{log.get('timestamp', '')[:19]}</td>
+                <td>{log.get('operation', '')}</td>
+                <td>{log.get('duration_seconds', 0):.3f}</td>
+                <td><span style="color:{'#f59e0b' if log.get('device_type') == 'mobile' else '#16a34a'}">{log.get('device_type', 'unknown')}</span></td>
+                <td class="mono" style="font-size:0.8em">{log.get('user_agent', '')[:100]}</td>
+            </tr>"""
+        
+        html += "</tbody></table></main></body></html>"
+        return html
+        
+    except Exception as e:
+        return f"<h1>Error reading logs: {e}</h1>"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
