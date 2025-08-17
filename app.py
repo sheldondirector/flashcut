@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
+# ---------------- stdlib ----------------
 from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory, flash
 from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime
-import subprocess, shutil, json, os
+import subprocess, shutil, json, os, sys, platform, textwrap
+
+# ---------------- numeric / plotting ----------------
 import numpy as np
 
 # Compatibility shims for deprecated numpy aliases used by some libs
@@ -13,10 +17,34 @@ if not hasattr(np, "complex"):
 if not hasattr(np, "float"):
     np.float = np.float64  # type: ignore[attr-defined]
 
-import librosa
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# Heavy deps we want to verify in diagnostics:
+diag_errors = {}
+try:
+    import librosa
+except Exception as e:
+    librosa = None  # type: ignore
+    diag_errors["librosa_import_error"] = repr(e)
+
+try:
+    import soundfile as sf
+except Exception as e:
+    sf = None  # type: ignore
+    diag_errors["soundfile_import_error"] = repr(e)
+
+try:
+    import audioread
+except Exception as e:
+    audioread = None  # type: ignore
+    diag_errors["audioread_import_error"] = repr(e)
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception as e:
+    matplotlib = None  # type: ignore
+    plt = None  # type: ignore
+    diag_errors["matplotlib_import_error"] = repr(e)
 
 FRAME_HOP = 512
 
@@ -26,16 +54,7 @@ BASE_DIR = Path(__file__).parent.resolve()
 JOBS_DIR = BASE_DIR / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
-INDEX_HTML = """
-<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Flash-cut Builder</title><link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css\"><style>body{padding-block:1rem}.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.wave{max-width:100%;border-radius:12px;border:1px solid #ddd;background:#fff}</style></head><body><main class=\"container\"><h2>Flash-cut Builder</h2>{% with messages = get_flashed_messages() %}{% if messages %}<article>{% for m in messages %}<p>{{m}}</p>{% endfor %}</article>{% endif %}{% endwith %}<form action=\"{{ url_for('analyze') }}\" method=\"post\" enctype=\"multipart/form-data\"><fieldset><legend>Audio</legend><input type=\"file\" name=\"audio\" accept=\".mp3,.m4a,.wav,.aac,.ogg,.flac,audio/mpeg,audio/mp4,audio/x-m4a,audio/wav,audio/*\" required></fieldset><div class=\"grid\"><fieldset><legend>Analysis</legend><label>FPS <input type=\"number\" name=\"fps\" step=\"1\" min=\"10\" max=\"120\" value=\"30\"></label><label>Onset threshold <input type=\"number\" name=\"threshold\" step=\"0.01\" min=\"0\" max=\"1\" value=\"0.30\"></label><label>Max gap (s) <input type=\"number\" name=\"max_gap\" step=\"0.05\" min=\"0.1\" max=\"10\" value=\"5.0\"></label></fieldset><fieldset><legend>Flash window</legend><label>Start (s) <input type=\"number\" name=\"flash_start\" step=\"0.1\" value=\"10\"></label><label>End (s) <input type=\"number\" name=\"flash_end\" step=\"0.1\" value=\"25\"></label><label>Min flash gap (s) <input type=\"number\" name=\"flash_gap\" step=\"0.01\" value=\"0.12\"></label></fieldset><fieldset><legend>Render (optional)</legend><label><input type=\"checkbox\" name=\"do_render\" value=\"1\"> Render video with ffmpeg</label><label>Video clips (multiple) <input type=\"file\" name=\"videos\" accept=\".mp4,.mov,.mkv,.m4v,.webm,video/*\" multiple></label><label>PNG images (multiple) <input type=\"file\" name=\"images\" accept=\"image/png\" multiple></label><label>Clip portion <select name=\"clip_mode\"><option value=\"head\" selected>Head (start)</option><option value=\"tail\">Tail (end)</option></select></label><label>Output file name <input type=\"text\" name=\"output_name\" value=\"final_video.mp4\"></label></fieldset></div><button type=\"submit\">Analyze</button></form></main></body></html>
-"""
-
-RESULT_HTML = """
-<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Flash-cut Result</title><link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css\"><style>.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.box{border:1px solid #ddd;border-radius:12px;padding:1rem;background:#fff}img.wave{max-width:100%;border-radius:12px;border:1px solid #ddd;background:#fff;max-height:320px;object-fit:cover}</style></head><body><main class=\"container\"><h2>Flash-cut Result</h2><p class=\"mono\">Job: {{ job_id }}</p><div class=\"grid\"><section class=\"box\"><h4>Summary</h4><ul><li>Onsets: <strong>{{ num_onsets }}</strong></li><li>Segments: <strong>{{ num_segments }}</strong></li><li>Flash cuts: <strong>{{ num_flash }}</strong> ({{ flash_start }}–{{ flash_end }} s)</li><li>FPS: {{ fps }}, Threshold: {{ threshold }}, Max gap: {{ max_gap }}</li></ul><div><a href=\"{{ url_for('download', job_id=job_id, filename='cuts.json') }}\">Download cuts.json</a> • <a href=\"{{ url_for('download', job_id=job_id, filename='cuts.csv') }}\">Download cuts.csv</a> • <a href=\"{{ url_for('download', job_id=job_id, filename='waveform.png') }}\">Download waveform.png</a>{% if rendered %} • <a href=\"{{ url_for('download', job_id=job_id, filename=output_name) }}\">Download {{ output_name }}</a>{% endif %}</div></section><section class=\"box\"><h4>Waveform</h4><img class=\"wave\" src=\"{{ url_for('download', job_id=job_id, filename='waveform.png') }}\" alt=\"waveform\"></section></div><details><summary>Segments (first 100)</summary><pre class=\"mono\" style=\"white-space:pre-wrap\">{{ segments_preview }}</pre></details><p><a href=\"{{ url_for('index') }}\">← New analysis</a></p></main></body></html>
-"""
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB cap
-
-# ---------------- helpers ----------------
+# ---------------- diagnostics helpers ----------------
 
 def _ffmpeg_bin() -> str:
     return os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "ffmpeg"
@@ -43,8 +62,234 @@ def _ffmpeg_bin() -> str:
 def _ffprobe_bin() -> str:
     return os.environ.get("FFPROBE") or shutil.which("ffprobe") or "ffprobe"
 
+def _cmd_ok(bin_name: str, *args: str, timeout: float = 3.0) -> Tuple[bool, str]:
+    try:
+        proc = subprocess.run([bin_name, *args], text=True, capture_output=True, timeout=timeout)
+        ok = proc.returncode == 0
+        out = (proc.stdout or "")[:4000]
+        err = (proc.stderr or "")[:4000]
+        return ok, (out or err) or ""
+    except Exception as e:
+        return False, repr(e)
+
+def _soundfile_ok() -> Tuple[bool, str]:
+    # Check libsndfile presence by asking available formats.
+    try:
+        if sf is None:
+            return False, "soundfile not importable"
+        fmts = sf.available_formats()
+        ok = bool(fmts)
+        info = "formats=" + ",".join(sorted(list(fmts.keys()))[:12])
+        # Also probe default library name if possible
+        lib = getattr(sf, "_libname", None)
+        if lib:
+            info += f" lib={lib}"
+        return ok, info
+    except Exception as e:
+        return False, repr(e)
+
+def get_diag() -> dict:
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    ff_ok, ff_ver = _cmd_ok(_ffmpeg_bin(), "-version")
+    fp_ok, fp_ver = _cmd_ok(_ffprobe_bin(), "-version")
+
+    sf_ok, sf_info = _soundfile_ok()
+
+    # quick numpy/BLAS info (non-fatal)
+    try:
+        np_show_config = ""
+        try:
+            from io import StringIO
+            buf = StringIO()
+            np.show_config(print_to=buf)  # type: ignore[arg-type]
+            np_show_config = buf.getvalue()
+        except Exception:
+            pass
+    except Exception:
+        np_show_config = ""
+
+    diag = {
+        "python": sys.version.split()[0],
+        "platform": f"{platform.system()} {platform.release()}",
+        "env": {
+            "PYTHON_VERSION": os.environ.get("PYTHON_VERSION"),
+            "NIXPACKS_PKGS": os.environ.get("NIXPACKS_PKGS"),
+            "PATH_has_ffmpeg": bool(ffmpeg),
+            "PATH_has_ffprobe": bool(ffprobe),
+        },
+        "versions": {
+            "numpy": getattr(np, "__version__", None),
+            "librosa": getattr(librosa, "__version__", None) if librosa else None,
+            "soundfile": getattr(sf, "__version__", None) if sf else None,
+            "audioread": getattr(audioread, "__version__", None) if audioread else None,
+            "matplotlib": getattr(matplotlib, "__version__", None) if matplotlib else None,
+        },
+        "bins": {
+            "ffmpeg_found": bool(ffmpeg),
+            "ffprobe_found": bool(ffprobe),
+            "ffmpeg_works": ff_ok,
+            "ffprobe_works": fp_ok,
+            "ffmpeg_version_head": (ff_ver or "")[:200],
+            "ffprobe_version_head": (fp_ver or "")[:200],
+        },
+        "audio_backends": {
+            "libsndfile_ok": sf_ok,
+            "libsndfile_info": sf_info,
+            "audioread_available": audioread is not None,
+        },
+        "numpy_config_snippet": (textwrap.shorten(np_show_config.replace("\n", " | "), width=800) if np_show_config else None),
+        "import_errors": diag_errors or None,
+        "recommendations": [
+            "On Railway, set env var NIXPACKS_PKGS='ffmpeg libsndfile' so MP3/M4A/WAV decode works.",
+            "Pin wheels in requirements.txt (numpy==1.26.4, librosa==0.10.2.post1, soundfile==0.12.1, audioread==3.0.1, matplotlib==3.8.4).",
+            "Gunicorn: --timeout 600 --threads 4 for long analyses.",
+        ],
+    }
+    return diag
+
+def render_diag_html(diag: dict) -> str:
+    # Pretty HTML card for inline display
+    def b(v: bool) -> str:
+        return f'<span style="color:{("#16a34a" if v else "#dc2626")};font-weight:600;">{"OK" if v else "MISSING"}</span>'
+    v = diag.get("versions", {})
+    bins = diag.get("bins", {})
+    ab = diag.get("audio_backends", {})
+    env = diag.get("env", {})
+    imports = diag.get("import_errors") or {}
+
+    rows = []
+    rows.append(f"<tr><td>Python</td><td>{diag.get('python')}</td></tr>")
+    rows.append(f"<tr><td>Platform</td><td>{diag.get('platform')}</td></tr>")
+    rows.append(f"<tr><td>numpy</td><td>{v.get('numpy')}</td></tr>")
+    rows.append(f"<tr><td>librosa</td><td>{v.get('librosa')}</td></tr>")
+    rows.append(f"<tr><td>soundfile</td><td>{v.get('soundfile')}</td></tr>")
+    rows.append(f"<tr><td>audioread</td><td>{v.get('audioread')}</td></tr>")
+    rows.append(f"<tr><td>matplotlib</td><td>{v.get('matplotlib')}</td></tr>")
+    rows.append(f"<tr><td>ffmpeg</td><td>{b(bins.get('ffmpeg_works'))} <small>{bins.get('ffmpeg_version_head','')}</small></td></tr>")
+    rows.append(f"<tr><td>ffprobe</td><td>{b(bins.get('ffprobe_works'))} <small>{bins.get('ffprobe_version_head','')}</small></td></tr>")
+    rows.append(f"<tr><td>libsndfile</td><td>{b(ab.get('libsndfile_ok'))} <small>{ab.get('libsndfile_info','')}</small></td></tr>")
+    rows.append(f"<tr><td>audioread module</td><td>{b(ab.get('audioread_available'))}</td></tr>")
+    rows.append(f"<tr><td>NIXPACKS_PKGS</td><td>{env.get('NIXPACKS_PKGS')}</td></tr>")
+    rows.append(f"<tr><td>PYTHON_VERSION</td><td>{env.get('PYTHON_VERSION')}</td></tr>")
+
+    imp_err_html = ""
+    if imports:
+        items = "".join(f"<li><code>{k}</code>: <code>{v}</code></li>" for k, v in imports.items())
+        imp_err_html = f"<details><summary><strong>Import errors</strong></summary><ul class='mono'>{items}</ul></details>"
+
+    np_conf = diag.get("numpy_config_snippet")
+    np_html = f"<details><summary>NumPy config</summary><pre class='mono'>{np_conf}</pre></details>" if np_conf else ""
+
+    recs = diag.get("recommendations") or []
+    rec_html = "".join(f"<li>{r}</li>" for r in recs)
+
+    return f"""
+    <section class="box">
+      <h4>Environment Diagnostics</h4>
+      <table>
+        <tbody>
+          {''.join(rows)}
+        </tbody>
+      </table>
+      {imp_err_html}
+      {np_html}
+      <details><summary>Raw JSON</summary><pre class="mono" style="white-space:pre-wrap;">{json.dumps(diag, indent=2)}</pre></details>
+      <h5>Recommendations</h5>
+      <ul>{rec_html}</ul>
+    </section>
+    """
+
+# ---------------- templates ----------------
+
+INDEX_HTML = """
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flash-cut Builder</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<style>
+body{padding-block:1rem}
+.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wave{max-width:100%;border-radius:12px;border:1px solid #ddd;background:#fff}
+.box{border:1px solid #ddd;border-radius:12px;padding:1rem;background:#fff}
+</style></head><body><main class="container">
+<h2>Flash-cut Builder</h2>
+<p class="mono"><a href="{{ url_for('diag_page') }}">Open full diagnostics → /diag</a></p>
+{% with messages = get_flashed_messages() %}{% if messages %}<article>{% for m in messages %}<p>{{m}}</p>{% endfor %}</article>{% endif %}{% endwith %}
+
+{{ diag_html|safe }}
+
+<form action="{{ url_for('analyze') }}" method="post" enctype="multipart/form-data">
+  <fieldset><legend>Audio</legend>
+    <input type="file" name="audio" accept=".mp3,.m4a,.wav,.aac,.ogg,.flac,audio/mpeg,audio/mp4,audio/x-m4a,audio/wav,audio/*" required>
+  </fieldset>
+  <div class="grid">
+    <fieldset><legend>Analysis</legend>
+      <label>FPS <input type="number" name="fps" step="1" min="10" max="120" value="30"></label>
+      <label>Onset threshold <input type="number" name="threshold" step="0.01" min="0" max="1" value="0.30"></label>
+      <label>Max gap (s) <input type="number" name="max_gap" step="0.05" min="0.1" max="10" value="5.0"></label>
+    </fieldset>
+    <fieldset><legend>Flash window</legend>
+      <label>Start (s) <input type="number" name="flash_start" step="0.1" value="10"></label>
+      <label>End (s) <input type="number" name="flash_end" step="0.1" value="25"></label>
+      <label>Min flash gap (s) <input type="number" name="flash_gap" step="0.01" value="0.12"></label>
+    </fieldset>
+    <fieldset><legend>Render (optional)</legend>
+      <label><input type="checkbox" name="do_render" value="1"> Render video with ffmpeg</label>
+      <label>Video clips (multiple) <input type="file" name="videos" accept=".mp4,.mov,.mkv,.m4v,.webm,video/*" multiple></label>
+      <label>PNG images (multiple) <input type="file" name="images" accept="image/png" multiple></label>
+      <label>Clip portion <select name="clip_mode"><option value="head" selected>Head (start)</option><option value="tail">Tail (end)</option></select></label>
+      <label>Output file name <input type="text" name="output_name" value="final_video.mp4"></label>
+    </fieldset>
+  </div>
+  <button type="submit">Analyze</button>
+</form>
+</main></body></html>
+"""
+
+RESULT_HTML = """
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flash-cut Result</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+<style>
+.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.box{border:1px solid #ddd;border-radius:12px;padding:1rem;background:#fff}
+img.wave{max-width:100%;border-radius:12px;border:1px solid #ddd;background:#fff;max-height:320px;object-fit:cover}
+</style></head><body><main class="container">
+<h2>Flash-cut Result</h2>
+<p class="mono">Job: {{ job_id }} • <a href="{{ url_for('diag_page') }}">Diagnostics</a></p>
+<div class="grid">
+<section class="box">
+  <h4>Summary</h4><ul>
+    <li>Onsets: <strong>{{ num_onsets }}</strong></li>
+    <li>Segments: <strong>{{ num_segments }}</strong></li>
+    <li>Flash cuts: <strong>{{ num_flash }}</strong> ({{ flash_start }}–{{ flash_end }} s)</li>
+    <li>FPS: {{ fps }}, Threshold: {{ threshold }}, Max gap: {{ max_gap }}</li>
+  </ul>
+  <div>
+    <a href="{{ url_for('download', job_id=job_id, filename='cuts.json') }}">Download cuts.json</a> •
+    <a href="{{ url_for('download', job_id=job_id, filename='cuts.csv') }}">Download cuts.csv</a> •
+    <a href="{{ url_for('download', job_id=job_id, filename='waveform.png') }}">Download waveform.png</a>
+    {% if rendered %} • <a href="{{ url_for('download', job_id=job_id, filename=output_name) }}">Download {{ output_name }}</a>{% endif %}
+  </div>
+</section>
+<section class="box">
+  <h4>Waveform</h4>
+  <img class="wave" src="{{ url_for('download', job_id=job_id, filename='waveform.png') }}" alt="waveform">
+</section>
+</div>
+
+{{ diag_html|safe }}
+
+<details><summary>Segments (first 100)</summary><pre class="mono" style="white-space:pre-wrap">{{ segments_preview }}</pre></details>
+<p><a href="{{ url_for('index') }}">← New analysis</a></p>
+</main></body></html>
+"""
+
+# ---------------- core helpers ----------------
+
 def run_cmd(cmd: List[str], cwd: str | Path | None = None):
-    """Run a subprocess and raise with captured logs on failure (friendlier Flask flash)."""
     proc = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -54,21 +299,21 @@ def run_cmd(cmd: List[str], cwd: str | Path | None = None):
         )
     return proc
 
-# ---------------- signal processing ----------------
-
 def quantize_to_fps(times: List[float], fps: float) -> List[float]:
     return [round(t * fps) / fps for t in times]
 
 def confidence_from_envelope(times, env, sr, hop):
     if len(times) == 0:
         return []
-    frames = librosa.time_to_frames(times, sr=sr, hop_length=hop)
+    frames = librosa.time_to_frames(times, sr=sr, hop_length=hop) if librosa else np.array([], dtype=int)
     frames = np.clip(frames, 0, len(env) - 1)
-    vals = env[frames]
+    vals = env[frames] if len(frames) else np.array([], dtype=float)
     scale = np.quantile(env, 0.98) or (env.max() or 1.0)
     return np.clip(vals / (scale if scale > 0 else 1.0), 0.0, 1.0).tolist()
 
 def detect_onsets_flux(y: np.ndarray, sr: int, hop: int = FRAME_HOP, threshold: float = 0.30) -> List[dict]:
+    if librosa is None:
+        return []
     _, y_perc = librosa.effects.hpss(y)
     env = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=hop, aggregate=np.median)
     onset_times = librosa.onset.onset_detect(
@@ -80,53 +325,50 @@ def detect_onsets_flux(y: np.ndarray, sr: int, hop: int = FRAME_HOP, threshold: 
     return [{"time": float(onset_times[i]), "confidence": float(conf[i])} for i in keep]
 
 def detect_beats(audio_path: str, threshold: float):
-    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    if librosa is None:
+        raise RuntimeError("librosa not available on server — see Diagnostics below.")
+    # Let librosa choose best backend (soundfile -> libsndfile, fallback to audioread/ffmpeg)
+    try:
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+    except Exception as e:
+        raise RuntimeError(
+            "Audio decode failed. Ensure ffmpeg & libsndfile are installed on the server "
+            "or upload WAV/FLAC/OGG. Original error: %s" % e
+        )
     duration = float(librosa.get_duration(y=y, sr=sr))
     events = detect_onsets_flux(y, sr, hop=FRAME_HOP, threshold=threshold)
     return events, duration, sr, y
 
-# ---------------- timeline building ----------------
-
 def compute_intervals(beats: List[dict], duration: float, fps: float, max_gap: float):
     end = round(duration * fps) / fps
     if not beats:
-        # chunk whole track into <= max_gap spans
-        splits = [0.0]
-        prev = 0.0
+        splits = [0.0]; prev = 0.0
         while end - prev > max_gap:
-            prev += max_gap
-            splits.append(prev)
+            prev += max_gap; splits.append(prev)
         splits.append(end)
         starts = [round(s, 3) for s in splits[:-1]]
         ends = [round(e, 3) for e in splits[1:]]
         return starts, ends
     beat_times = quantize_to_fps(sorted(float(b["time"]) for b in beats), fps)
-    splits = [0.0]
-    prev = 0.0
+    splits = [0.0]; prev = 0.0
     first = beat_times[0]
     while first - prev > max_gap:
-        prev += max_gap
-        splits.append(prev)
+        prev += max_gap; splits.append(prev)
     splits.append(first)
     for i in range(1, len(beat_times)):
         L, R = beat_times[i - 1], beat_times[i]
         prev = L
         while R - prev > max_gap:
-            prev += max_gap
-            splits.append(prev)
+            prev += max_gap; splits.append(prev)
         splits.append(R)
-    # ensure tail to full end
     if end > splits[-1]:
         prev = splits[-1]
         while end - prev > max_gap:
-            prev += max_gap
-            splits.append(prev)
+            prev += max_gap; splits.append(prev)
         splits.append(end)
     starts = [round(s, 3) for s in splits[:-1]]
     ends = [round(e, 3) for e in splits[1:]]
     return starts, ends
-
-# ---------------- flash window ----------------
 
 def detect_flash_window(y: np.ndarray, sr: int, window: Tuple[float, float], min_gap: float, fps: float, threshold: float) -> List[float]:
     start_s, end_s = max(0.0, min(window)), max(0.0, max(window))
@@ -140,11 +382,8 @@ def detect_flash_window(y: np.ndarray, sr: int, window: Tuple[float, float], min
     g = max(1.0 / fps, float(min_gap))
     for t in times:
         if t - last >= g:
-            pruned.append(t)
-            last = t
+            pruned.append(t); last = t
     return quantize_to_fps(pruned, fps)
-
-# ---------------- rendering (PNG and VIDEO) ----------------
 
 def render_from_images(pngs: List[str], starts: List[float], ends: List[float], audio: str, fps: float, out_path: str) -> None:
     ffmpeg = _ffmpeg_bin()
@@ -163,7 +402,6 @@ def render_from_images(pngs: List[str], starts: List[float], ends: List[float], 
         ]
         run_cmd(cmd)
         clip_paths.append(out_i)
-    # concat list with explicit header + LF newlines (Windows friendly)
     list_file = tmp / "list.txt"
     list_text = "ffconcat version 1.0\n" + "\n".join(f"file '{p.name}'" for p in clip_paths) + "\n"
     list_file.write_text(list_text, encoding="utf-8", newline="\n")
@@ -175,7 +413,6 @@ def render_from_images(pngs: List[str], starts: List[float], ends: List[float], 
     ], cwd=tmp)
     run_cmd([ffmpeg, "-y", "-i", str(concat_out), "-i", audio, "-c:v", "copy", "-c:a", "aac", "-shortest", out_path])
 
-
 def probe_video_meta(path: str):
     ffprobe = _ffprobe_bin()
     try:
@@ -185,8 +422,7 @@ def probe_video_meta(path: str):
             "-of", "json", path,
         ], check=True, capture_output=True, text=True)
         data = json.loads(proc.stdout or "{}")
-        w = h = None
-        dur = None
+        w = h = None; dur = None
         if data.get("streams"):
             s0 = data["streams"][0]
             w = int(s0.get("width") or 0) or None
@@ -202,7 +438,6 @@ def probe_video_meta(path: str):
         return w, h, float(dur)
     except Exception:
         return 1280, 720, 0.0
-
 
 def render_from_videos(videos: List[str], starts: List[float], ends: List[float], audio: str, fps: float, out_path: str, clip_mode: str = "head") -> None:
     if not videos:
@@ -237,7 +472,6 @@ def render_from_videos(videos: List[str], starts: List[float], ends: List[float]
         run_cmd(cmd)
         clip_paths.append(out_i)
 
-    # Concat (Windows-safe)
     list_file = tmp / "list.txt"
     list_text = "ffconcat version 1.0\n" + "\n".join(f"file '{p.name}'" for p in clip_paths) + "\n"
     list_file.write_text(list_text, encoding="utf-8", newline="\n")
@@ -248,13 +482,30 @@ def render_from_videos(videos: List[str], starts: List[float], ends: List[float]
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart", str(concat_out),
     ], cwd=tmp)
 
-    # Mux with audio
     run_cmd([ffmpeg, "-y", "-i", str(concat_out), "-i", audio, "-c:v", "copy", "-c:a", "aac", "-shortest", out_path])
 
 # ---------------- routes ----------------
+
 @app.route("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    diag = get_diag()
+    return render_template_string(INDEX_HTML, diag_html=render_diag_html(diag))
+
+@app.route("/diag")
+def diag_page():
+    diag = get_diag()
+    PAGE = """
+    <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Diagnostics</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.box{border:1px solid #ddd;border-radius:12px;padding:1rem;background:#fff;}</style>
+    </head><body><main class="container">
+    <h2>Diagnostics</h2>
+    <p><a href="{{ url_for('index') }}">← Back</a></p>
+    {{ diag_html|safe }}
+    </main></body></html>
+    """
+    return render_template_string(PAGE, diag_html=render_diag_html(diag))
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -287,12 +538,10 @@ def analyze():
     except Exception as e:
         flash("Failed to read audio. If you uploaded MP3, enable FFmpeg on Railway or upload a WAV/FLAC/OGG file.\n" + str(e))
         return redirect(url_for("index"))
+
     starts, ends = compute_intervals(events, duration, fps, max_gap)
 
     flash_times = detect_flash_window(y, sr, (flash_start, flash_end), flash_gap, fps, threshold) if flash_end > flash_start else []
-    if flash_times:
-        # If we later remove flash window UI, leave this here behind a feature flag
-        starts, ends = inject_flash_splits(starts, ends, flash_times, fps)
 
     data = {
         "audio": audio_file.filename,
@@ -330,7 +579,6 @@ def analyze():
             except Exception as e:
                 flash(f"ffmpeg video render failed:\n{e}")
         else:
-            # PNG fallback
             images = request.files.getlist("images")
             pngs: List[str] = []
             for f in images:
@@ -356,6 +604,7 @@ def analyze():
         preview_lines.append(f"{i+1:03d}: {s:.3f} – {e:.3f}")
     segments_preview = "\n".join(preview_lines)
 
+    diag = get_diag()
     return render_template_string(
         RESULT_HTML,
         job_id=job_id,
@@ -363,7 +612,8 @@ def analyze():
         flash_start=flash_start, flash_end=flash_end,
         num_onsets=len(events), num_segments=len(starts), num_flash=len(flash_times),
         segments_preview=segments_preview,
-        rendered=rendered, output_name=output_name
+        rendered=rendered, output_name=output_name,
+        diag_html=render_diag_html(diag),
     )
 
 @app.route("/jobs/<job_id>/<path:filename>")
@@ -381,20 +631,19 @@ def inject_flash_splits(starts: List[float], ends: List[float], flash_times: Lis
     for s, e in zip(starts, ends):
         cuts = [t for t in flash if s < t < e]
         if not cuts:
-            out_s.append(s)
-            out_e.append(e)
+            out_s.append(s); out_e.append(e)
             continue
         pts = [s] + cuts + [e]
         for i in range(len(pts) - 1):
             a, b = pts[i], pts[i + 1]
             if b - a < 1.0 / fps:
                 b = a + 1.0 / fps
-            out_s.append(round(a, 3))
-            out_e.append(round(b, 3))
+            out_s.append(round(a, 3)); out_e.append(round(b, 3))
     return out_s, out_e
 
-
 def plot_waveform(png_path: Path, y: np.ndarray, sr: int, flash_times: List[float], window: Tuple[float, float]):
+    if plt is None or librosa is None:
+        return
     t = np.linspace(0, librosa.get_duration(y=y, sr=sr), num=len(y), endpoint=True)
     plt.figure(figsize=(18, 4))
     plt.fill_between(t, y, -y, color="#f0b429", alpha=0.25)
@@ -411,16 +660,11 @@ def plot_waveform(png_path: Path, y: np.ndarray, sr: int, flash_times: List[floa
     plt.tight_layout()
     plt.savefig(png_path, dpi=150)
     plt.close()
-# --- keep everything above as-is ---
 
 @app.route("/health")
 def health():
     return {"ok": True}
 
 if __name__ == "__main__":
-    import os
-    import matplotlib
-    matplotlib.use("Agg")  # headless on Railway
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-
